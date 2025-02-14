@@ -1,42 +1,40 @@
-| 配置项 | 说明 |
-| --- | --- |
-| `CONFIG_BUG=y` | 启用内核中的BUG报告机制，确保能报告各种内核硬化操作。 |
-| `CONFIG_STRICT_KERNEL_RWX=y` | 强制内核内存区域的可执行性、可读性和可写性进行严格的权限控制，从而减少攻击面。 |
-| `CONFIG_STRICT_MODULE_RWX=y` | 强制内核模块（如驱动程序）的内存区域具有严格的权限控制，防止攻击者执行恶意代码。 |
-| `CONFIG_VMAP_STACK=y` | 启用堆栈的虚拟内存映射，增加栈溢出攻击的难度。 |
-| `CONFIG_RANDOMIZE_BASE=y` | 启用内核基础地址的随机化（ASLR）。这样可以使攻击者难以预测内核的位置。 |
-| `CONFIG_RANDOMIZE_MEMORY=y` | 启用内核内存的随机化，增加内存布局的不确定性，进一步加强攻击难度。 |
-| `CONFIG_SLAB_FREELIST_RANDOM=y` | 随机化slab分配器的freelist（自由链表），增加堆分配的不可预测性。 |
-| `CONFIG_SLAB_FREELIST_HARDENED=y` | 对slab分配器的freelist进行硬化，以减少针对分配器的攻击面。 |
-| `CONFIG_SLAB_BUCKETS=y` | 启用slab分配器的桶化机制，提高内存分配的安全性。 |
-| `CONFIG_SHUFFLE_PAGE_ALLOCATOR=y` | 启用页面分配器的随机化，增强堆分配的随机性，增加攻击者的猜测难度。 |
-| `CONFIG_RANDOM_KMALLOC_CACHES=y` | 随机化kmalloc缓存池的分配，减少内存分配的预测性。 |
-| `CONFIG_PAGE_TABLE_CHECK=y` | 启用页表检查，增加对恶意内存写操作的检测。 |
-| `CONFIG_PAGE_TABLE_CHECK_ENFORCED=y` | 强制执行页表检查，防止用户空间访问不允许的内存区域。 |
-| `CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y` | 随机化内核栈的偏移量，增加栈溢出攻击的难度。 |
-| `CONFIG_STACKPROTECTOR=y` | 启用栈保护（Stack Protector），通过在栈上添加保护值来防止栈溢出攻击。 |
-| `CONFIG_STACKPROTECTOR_STRONG=y` | 启用更强的栈保护机制，增强对栈溢出攻击的防护能力。 |
-| `CONFIG_HARDENED_USERCOPY=y` | 确保内核在执行内存拷贝时会对拷贝长度进行检查，防止越界访问。 |
-| `CONFIG_FORTIFY_SOURCE=y` | 启用编译器的“FORTIFY”功能，通过内置的缓冲区检查防止常见的内存漏洞。 |
-| `CONFIG_UBSAN=y` | 启用未定义行为检查（UBSAN），可以捕获例如数组越界、整数溢出等错误。 |
-| `CONFIG_UBSAN_TRAP=y` | 启用触发未定义行为时的崩溃处理，方便开发者发现潜在错误。 |
-| `CONFIG_UBSAN_BOUNDS=y` | 启用对数组下标越界等错误的检查，防止访问越界的内存。 |
-| `CONFIG_KFENCE=y` | 启用基于采样的堆溢出和使用后释放（UAF）检测，增强内存安全性。 |
-| `CONFIG_LIST_HARDENED=y` | 启用链表的完整性检查，防止链表操作中发生破坏性修改。 |
-| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` | 默认启用堆分配时将内存初始化为零，以避免使用未初始化的内存。 |
-| `CONFIG_INIT_STACK_ALL_ZERO=y` | 默认启用栈变量初始化为零，防止栈溢出攻击利用未初始化的栈数据。 |
-| `CONFIG_RESET_ATTACK_MITIGATION=y` | 启用在系统重启时通过EFI清除RAM的功能，以防止冷启动攻击。 |
-| `CONFIG_EFI_DISABLE_PCI_DMA=y` | 禁止EFI手off后到内核IOMMU设置之前的DMA操作，防止恶意设备通过DMA攻击内核。 |
-| `CONFIG_IOMMU_SUPPORT=y` | 启用IOMMU（输入输出内存管理单元）支持，增强设备访问内存的安全性。 |
-| `CONFIG_IOMMU_DEFAULT_DMA_STRICT=y` | 强制IOMMU进行严格的DMA访问控制，防止恶意设备访问内核内存。 |
-| `CONFIG_STRICT_DEVMEM=y` | 禁止直接访问设备内存，防止非设备的内存被错误访问。 |
-| `CONFIG_IO_STRICT_DEVMEM=y` | 强制设备内存访问进行更严格的检查，减少硬件和内核之间的潜在攻击面。 |
-| `CONFIG_SECCOMP=y` | 启用seccomp（安全计算模式），减少系统调用接口的攻击面。 |
-| `CONFIG_SECCOMP_FILTER=y` | 启用seccomp过滤器，通过BPF过滤系统调用，增加系统调用的安全性。 |
-| `CONFIG_SYN_COOKIES=y` | 启用SYN Cookie防御机制，防止SYN洪水攻击。 |
-| `CONFIG_CFI_CLANG=y` | 启用Clang的控制流完整性（CFI）支持，可以检测并阻止控制流篡改攻击。 |
-| `CONFIG_LDISC_AUTOLOAD is not set` | 禁用自动加载TTY行控制子系统，减少TTY设备的攻击面。 |
-| `CONFIG_COMPAT_BRK is not set` | 禁用兼容性brk系统调用，防止通过brk修改用户空间地址空间布局的攻击。 |
-| `CONFIG_PROC_KCORE is not set` | 禁用暴露内核文本映像布局（kcore），减少攻击者对内核内部结构的了解。 |
-| `CONFIG_COMPAT_VDSO is not set` | 禁用兼容性VDSO，防止暴露用户空间的VDSO布局。 |
-| `CONFIG_LEGACY_PTYS is not set` | 禁用旧版PTY接口，仅使用现代PTY接口（devpts），减少攻击面。 |
+| **配置选项**                         | **类型** | **作用**                                                                 | **原理/防御场景**                                                                 | **状态** | **注意事项**                                                                 |
+|--------------------------------------|----------|--------------------------------------------------------------------------|----------------------------------------------------------------------------------|-----------|------------------------------------------------------------------------------|
+| `CONFIG_BUG`                         | 基础     | 启用内核错误报告机制                                                     | 允许内核在检测到内部错误时触发警告或崩溃，便于调试和漏洞发现                     | 启用      | 生产环境可能需要禁用以防止拒绝服务                                           |
+| `CONFIG_STRICT_KERNEL_RWX`           | 内存保护 | 强制内核代码段为只读 (RX)，数据段为读写 (RW)                            | 防止代码注入攻击（W^X原则）                                                      | 启用      | 依赖硬件MMU支持                                                             |
+| `CONFIG_STRICT_MODULE_RWX`           | 内存保护 | 强制内核模块代码段为只读 (RX)                                           | 防止恶意模块修改自身代码                                                         | 启用      | 需与模块签名 (`CONFIG_MODULE_SIG`) 配合使用                                  |
+| `CONFIG_VMAP_STACK`                  | 栈保护   | 使用虚拟内存映射内核栈                                                   | 隔离栈与其他内存区域，防御栈溢出攻击                                              | 启用      | 轻微性能开销（约2%）                                                        |
+| `CONFIG_RANDOMIZE_BASE`              | ASLR     | 内核镜像地址随机化 (KASLR)                                               | 增加攻击者预测代码位置的难度，缓解ROP攻击                                         | 启用      | 部分旧CPU可能不支持                                                         |
+| `CONFIG_RANDOMIZE_MEMORY`            | ASLR     | 物理内存映射区域随机化                                                   | 随机化直接物理映射区的布局，防御物理内存探测攻击                                  | 启用      | 需内核版本≥4.11                                                             |
+| `CONFIG_SLAB_FREELIST_RANDOM`        | 堆防护   | 随机化SLAB分配器的空闲列表顺序                                           | 防止堆布局预测（如CVE-2021-22555利用固定顺序的freelist）                         | 启用      | 仅影响SLAB分配器                                                            |
+| `CONFIG_SLAB_FREELIST_HARDENED`      | 堆防护   | 在SLAB元数据中添加校验码                                                 | 检测堆元数据篡改（如双重释放）                                                   | 启用      | 元数据额外占用4字节/对象                                                    |
+| `CONFIG_SLAB_BUCKETS`                | 堆防护   | 提供用户自定义的隔离分配桶                                                     | 减少不同大小对象之间的内存布局可预测性（重用）                                            | 启用      | 与`CONFIG_SLAB_FREELIST_RANDOM`协同工作                                      |
+| `CONFIG_SHUFFLE_PAGE_ALLOCATOR`      | 堆防护   | 随机化页分配器 (Page Allocator) 的内存分配顺序                           | 防御页面重用                                                 | 启用      | 需要内核版本≥5.2                                                            |
+| `CONFIG_RANDOM_KMALLOC_CACHES`       | 堆防护   | 创建多个不会被合并的通用slab缓存副本，并在分配时随机选择其中一个                | 防止攻击者在堆上喷洒漏洞对象以利用内存漏洞                                                   | 启用      | 仅影响`kmalloc`分配路径                                                     |
+| `CONFIG_PAGE_TABLE_CHECK`            | 内存检查 | 检查用户空间页表映射的合法性                                             | 防御非法内存映射操作（如CVE-2022-2590）                                          | 启用      | 依赖`CONFIG_ARCH_SUPPORTS_PAGE_TABLE_CHECK`                                  |
+| `CONFIG_PAGE_TABLE_CHECK_ENFORCED`   | 内存检查 | 强制启用页表检查                                                         | 防止绕过`CONFIG_PAGE_TABLE_CHECK`                                                | 启用      | 需要先启用`CONFIG_PAGE_TABLE_CHECK`                                          |
+| `CONFIG_RANDOMIZE_KSTACK_OFFSET`     | 栈保护   | 随机化系统调用入口的栈偏移量                                             | 增加ROP链构造难度                                                                | 启用      | 默认偏移量随机范围为0-256字节                                               |
+| `CONFIG_STACKPROTECTOR`              | 栈保护   | 基本栈溢出保护（金丝雀检测）                                             | 检测栈溢出攻击                                                                   | 启用      | 保护使用数组或局部变量的函数                                                |
+| `CONFIG_STACKPROTECTOR_STRONG`       | 栈保护   | 增强版栈保护，覆盖更多函数                                               | 扩大金丝雀保护范围                                                               | 启用      | 性能开销略高于基础版本                                                      |
+| `CONFIG_HARDENED_USERCOPY`           | 内存检查 | 检查用户空间与内核空间之间的拷贝操作                                     | 防御越界读写（如CVE-2017-14954）                                                 | 启用      | 仅检查`copy_to_user`/`copy_from_user`等接口                                 |
+| `CONFIG_FORTIFY_SOURCE`              | 编译防护 | 编译时替换不安全字符串函数并添加长度检查                                 | 防御缓冲区溢出（如`strcpy`误用）                                                 | 启用      | 需要编译器支持 (GCC≥9或Clang≥12)                                            |
+| `CONFIG_UBSAN`                       | 运行时检 | 启用未定义行为检测                                                       | 检测数组越界、空指针解引用等                                                     | 启用      | 生产环境建议禁用（性能开销）                                                |
+| `CONFIG_UBSAN_TRAP`                  | 运行时检 | 在检测到未定义行为时触发内核崩溃                                         | 强制暴露漏洞而非继续执行                                                         | 启用      | 仅调试使用                                                                  |
+| `CONFIG_UBSAN_BOUNDS`                | 运行时检 | 检查数组索引越界                                                         | 防御越界访问（如CVE-2021-42008）                                                 | 启用      | 影响循环密集型代码性能                                                      |
+| `CONFIG_KFENCE`                      | 堆防护   | 轻量级内存错误检测器                                                     | 周期性检测越界访问和使用后释放 (UAF)                                             | 启用      | 采样间隔可调（默认100ms）                                                   |
+| `CONFIG_LIST_HARDENED`               | 数据结构 | 校验链表操作的完整性                                                     | 防御链表篡改（如CVE-2021-27365）                                                 | 启用      | 通过指针混淆实现                                                            |
+| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON`    | 内存防护 | 分配内存时自动初始化为零                                                 | 防止未初始化内存泄露敏感数据                                                     | 启用      | 性能影响：小对象分配延迟增加约5%                                            |
+| `CONFIG_INIT_STACK_ALL_ZERO`         | 栈防护   | 函数入口时初始化栈变量为零                                               | 防御未初始化栈变量泄露                                                           | 启用      | 与`CONFIG_INIT_ON_ALLOC`互补                                                 |
+| `CONFIG_RESET_ATTACK_MITIGATION`     | 硬件防护 | 重启时擦除内存                                                           | 防御冷启动攻击（如通过物理访问提取RAM中的密钥）                                   | 启用      | 依赖UEFI固件支持                                                            |
+| `CONFIG_EFI_DISABLE_PCI_DMA`         | 硬件防护 | 在EFI到内核IOMMU初始化期间禁用PCI DMA                                    | 防止DMA攻击窗口                                                                  | 启用      | 仅影响启动阶段                                                              |
+| `CONFIG_IOMMU_SUPPORT`               | 硬件防护 | 启用IOMMU支持                                                           | 隔离设备DMA内存访问                                                              | 启用      | 需要硬件IOMMU（如Intel VT-d, AMD-Vi）                                       |
+| `CONFIG_IOMMU_DEFAULT_DMA_STRICT`    | 硬件防护 | 强制IOMMU严格DMA映射                                                    | 设备只能访问明确授权的内存区域                                                   | 启用      | 可能影响旧设备兼容性                                                        |
+| `CONFIG_SECCOMP`                     | 攻击面   | 启用Seccomp基础支持                                                      | 允许进程限制可用的系统调用                                                       | 启用      | 需用户空间配合（如Docker的`--security-opt seccomp=...`）                    |
+| `CONFIG_SECCOMP_FILTER`              | 攻击面   | 允许通过BPF定义自定义Seccomp策略                                         | 精细化控制系统调用（如禁止`ptrace`）                                             | 启用      | 需要启用`CONFIG_BPF`                                                        |
+| `CONFIG_SYN_COOKIES`                 | 网络防护 | 抵御SYN洪水攻击                                                          | 无需维护半开连接状态表                                                           | 启用      | 在`/proc/sys/net/ipv4/tcp_syncookies`中可动态调整                           |
+| `CONFIG_CFI_CLANG`                   | 控制流   | 控制流完整性（Clang实现）                                                | 验证间接跳转目标合法性（如函数指针）                                             | 启用      | 仅支持Clang编译器，性能开销约1%                                             |
+| `CONFIG_LDISC_AUTOLOAD`            | 攻击面   | **禁用** TTY线路规程自动加载                                             | 防御通过特制串口数据触发模块加载（如CVE-2020-25643）                             | 禁用      | 需要手动加载线路规程模块                                                    |
+| `CONFIG_COMPAT_BRK`                | 用户防护 | **禁用** 用户空间堆 (brk) 的ASLR                                         | 防止攻击者预测堆布局                                                             | 禁用      | 可能影响老旧32位应用兼容性                                                  |
+| `CONFIG_PROC_KCORE`                | 信息防护 | **禁用** `/proc/kcore`访问                                               | 阻止通过内存转储获取内核敏感信息                                                 | 禁用      | 调试工具（如crash）需要此配置                                               |
+| `CONFIG_COMPAT_VDSO`               | ASLR     | **禁用** 旧版VDSO ASLR                                                   | 强制使用新版ASLR实现                                                             | 禁用      | 仅影响传统32位兼容性                                                        |
+| `CONFIG_LEGACY_PTYS`               | 攻击面   | **禁用** 传统PTY设备                                                     | 强制使用更安全的`devpts`（如防御CVE-2019-13272）                                 | 禁用      | 旧版程序可能需要`/dev/ptyXX`设备节点                                         |
