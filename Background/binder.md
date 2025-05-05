@@ -1,6 +1,7 @@
 # Binder
 
-* [参考](https://androidoffsec.withgoogle.com/posts/attacking-android-binder-analysis-and-exploitation-of-cve-2023-20938/#binder)
+* [参考1](https://androidoffsec.withgoogle.com/posts/attacking-android-binder-analysis-and-exploitation-of-cve-2023-20938/#binder)
+* [参考2](https://0xkol.github.io/assets/files/Racing_Against_the_Lock__Exploiting_Spinlock_UAF_in_the_Android_Kernel.pdf)
 
 Binder 是 Android 上主要的进程间通信（IPC）通道。它支持跨进程传递文件描述符和包含指针的对象等多种功能。**Binder 由 Android 平台提供的用户空间库（libbinder 和 libhwbinder）以及 Android 通用内核中的内核驱动组成**。因此，它为 Java 和本地代码提供了一个可通过 AIDL 定义的通用 IPC 接口。术语 “Binder” 常被用来泛指其实现的多个部分（Android SDK 中甚至有一个名为 Binder 的 Java 类），但在本文中，除非另有说明，“Binder” 指的是 Binder 设备驱动。
 
@@ -11,6 +12,116 @@ Android 上所有不受信任的应用都处于沙箱中，进程间通信主要
 为了实现高性能的 IPC，Binder 拥有极其复杂的对象生命周期管理、内存管理和并发线程模型。为说明其复杂度，我们在实现驱动的 6.5k 行代码中统计出了三种不同类型的并发同步原语（5 个锁、6 个引用计数器以及一些原子变量）。Binder 的锁机制也非常细粒度，以提升性能，这进一步增加了代码的复杂性。
 
 近年来，攻击者利用 Binder 中的多个安全问题（主要是 use-after-free 漏洞）成功发起了一系列攻击。这些漏洞源自多种根本原因，包括清理逻辑不当（CVE-2019-2215 和 CVE-2022-20421）、数据竞争（CVE-2020-0423）以及对象内部的越界访问（CVE-2020-0041）。本文介绍的 use-after-free 漏洞则源于处理 Binder 事务时清理逻辑错误，导致引用计数错误。
+
+## Binder设备生命周期
+
+当进程需要通过Binder进行通信时，需先用open打开Binder设备。内核中会调用`binder_open()`函数。该函数首先通过`kzalloc()`分配一个名为`binder_proc`的结构体，初始化后通过文件的`private_data`字段将其与打开的文件描述符关联。  
+
+`binder_proc`结构体包含以下关键字段：  
+* `threads`：存储该进程所属`binder_thread`对象的红黑树。  
+* `nodes`：存储该进程所属`binder_node`对象的红黑树。  
+* `refs_by_desc`、`refs_by_node`：按不同键排序的`binder_ref`对象红黑树。  
+* `tmp_ref`：引用计数。归零时释放结构体。  
+* `inner_lock`、`outer_lock`：用于线程安全的自旋锁。  
+
+当用户态不再使用Binder服务时，关闭其Binder文件描述符：
+
+```c
+close(binder_fd);
+```  
+
+内核中会调用`binder_release()`函数。该函数不会立即清理`binder_proc`结构体，而是通过延迟工作（deferred work）机制处理。实际清理逻辑位于`binder_deferred_release(proc)`，具体步骤如下：  
+1. 从全局列表移除：将`proc`从系统级`binder_procs`列表中移除。  
+2. 标记终止状态：递增`proc`的引用计数，并设置其`is_dead`标志为`true`。  
+3. 释放线程：调用`binder_thread_release(proc, thread)`释放所有关联的`binder_thread`。  
+4. 释放节点：调用`binder_node_release(node)`释放进程拥有的所有`binder_node`。  
+5. 释放引用：对每个引用调用`binder_cleanup_ref_olocked(ref)`和`binder_free_ref(ref)`。  
+6. 清理工作项：  
+   ```c
+   binder_release_work(proc, &proc->todo);
+   binder_release_work(proc, &proc->delivered_death);
+   ```  
+7. 最终释放：递减`proc`的引用计数，若归零则调用`binder_proc_dec_tmpref(proc)`释放结构体。  
+
+## Binder事务
+
+需要明确的是，Binder框架中交换的消息被称为事务（transactions）。事务除了可以包含原始数据外，还可以选择性地包含对象。Binder支持7种类型的对象，这些对象通过BINDER_TYPE_*常量来标识（参见include/uapi/linux/android/binder.h）。
+
+这些对象包括：支持在进程间传递文件描述符的对象（FD和FDA）、支持分散-聚集（scatter-gather）功能的对象（PTR），以及最重要的，支持Binder框架本身的对象（BINDER、HANDLE及其"weak"变体）。
+
+![binder_transaction.png](./images/binder_transaction.png)
+
+当内核驱动处理事务时，它会处理每个嵌入的对象，并执行所有必要的操作将其传递到另一端。这个过程被称为对象转换（object translation）。每种对象类型都需要采取不同的转换操作。例如，假设进程A想要将文件描述符10传递给进程B。为此，进程A会准备一个新事务，其中包含一个类型为FD的对象，指定fd编号为10。在事务处理过程中，内核将在进程B中分配一个新的未使用的fd（假设是54），并将这个新fd链接到与进程A相同的底层文件。当进程B读取该事务时，它将看到一个类型为FD的对象，其中包含fd编号54，可以用于进一步的交互。需要注意的是，驱动程序会改变被转换对象的细节（在本例中是fd编号），以便这些细节在另一端读取时是有意义的。
+
+对象转换可能由于多种原因而失败，包括权限不足（SELinux检查）、用户指定的对象不正确或内部错误（例如内存分配失败或其他逻辑差异）。当某个对象转换失败时，整个事务将被视为错误，不会传递到另一端。在错误代码流程中，驱动程序会清理事务缓冲区，有效地撤销已经成功转换的对象的转换。然而，导致错误的对象不会被清理。这是合理的，因为负责转换的函数在返回错误时应该自行清理（外部代码流程不知道转换过程中的哪一步失败了）。
+
+## Binder对象与引用
+
+要与一个进程通信，发送方进程必须拥有一个指向目标进程所拥有的 Binder 对象的引用。（当我们说“Binder 对象”时，我们指的是一种类型为“Binder”的对象。）以这种方式，Binder 对象作为 Binder 事务的一个端点。
+
+根据引用它的进程不同，Binder 对象的标识方式也不同。从拥有该 Binder 对象的进程的角度来看，它们通过一个称为 ptr 的 8 字节值来标识，该值对内核而言是不透明的。我们将以这种方式标识的 Binder 对象称为本地 Binder 对象。本地 Binder 对象在内核中使用 binder_node 结构表示。
+
+其他进程使用一个称为 handle 的 32 位值来引用目标进程的 Binder 对象。当以这种方式标识时，它们被称为远程 Binder 对象。在内部，handle 值被映射到一个称为 binder_ref 的内核对象，该对象进一步引用 binder_node。见下图。
+
+![binder_obj_ref.png](./images/binder_obj_ref.png)
+
+Binder 对象是唯一且不可伪造的。内核通过维护它们的身份来确保其唯一性。
+* 内核确保每个进程中对于给定的 ptr 只存在一个本地 Binder 对象。
+* 内核还确保一个进程只能为某个特定 Binder 对象持有一个引用。
+
+一个进程可以将 Binder 对象传递给另一个进程，从而赋予另一个进程访问该对象的权限。该通信通过在 Binder 事务中嵌入特殊对象来完成。根据 Binder 对象是以本地方式还是远程方式标识的，所采取的步骤会有所不同，但结果是相同的：**在另一端创建一个远程 Binder 对象来引用被传递的 Binder 对象**。如果没有其他进程传递，是不可能伪造一个 Binder 对象引用的。
+
+### 远程Binder对象传递
+
+如前所述，远程 Binder 对象是通过 handle 值来标识的。要将一个远程 Binder 对象传递给另一个进程，必须准备一个新的事务，其中包含一个类型为 HANDLE 的对象，并指定相关的 handle 值。
+
+当内核处理该事务并对对象进行转换时，会在目标进程中创建一个新的 Binder 引用（`binder_ref`），如果目标进程中尚不存在针对该特定 Binder 对象的引用的话。在创建新的 Binder 引用的过程中，会为其分配一个新的 handle 值（以便用户空间可以引用它）。当目标进程读取事务时，它会看到一个类型为 HANDLE 的对象，其中包含刚刚分配的新 handle 值。见下图。
+
+![pass_remote.png](./images/pass_remote.png)
+
+（如果针对被传递的 Binder 对象已经存在一个 Binder 引用，内核就直接使用已有 Binder 引用的 handle 值。）
+
+### 本地Binder对象传递
+
+当传递以`ptr`标识的本地Binder对象时：
+1. 发送方在事务中嵌入类型为`BINDER`的对象，并指定ptr值
+2. 内核处理时：
+   * 在发送方进程创建`binder_node`（若不存在）
+   * 在接收方进程创建`binder_ref`（若不存在）
+3. 内核将事务中的对象类型从`BINDER`改写为`HANDLE`，并附上新分配的handle值
+
+## 强引用与弱引用
+
+Binder 引用分为强引用和弱引用两种。
+* 要向 Binder 对象发送事务，必须持有其强引用。强引用通过 BINDER（本地）和 HANDLE（远程）两种对象类型传递。  
+* 弱引用适用于无需发送事务的场景，例如接收死亡通知（详见[下文](#死亡通知)）。弱引用通过 WEAK_BINDER（本地）和 WEAK_HANDLE（远程）对象类型传递。  
+* 强引用可降级为弱引用，但弱引用无法直接升级为强引用，除非从通信对端获取新的强引用。（虽然 BC_ATTEMPT_ACQUIRE 命令支持此类升级，但 Android 目前未实现该功能。）
+
+## 引用计数
+
+一般来说，如果一个实体引用了某个对象，该对象会统计其被引用的次数。当引用数为零时，对象即可被释放。这种机制称为引用计数（refcounting），是 Android 平台（如 `sp<>`、`wp<>`）中用于自动管理对象内存的常用技术。  
+
+由于 Binder 中存在对跨进程 Binder 对象的引用，其引用计数机制需扩展到进程边界：  
+
+1. 用户空间对象引用内核的 `binder_ref` 对象  
+   * 用户空间通过以下命令通知内核引用计数的变更：  
+     * 强引用增减：`BC_ACQUIRE`（增加）、`BC_RELEASE`（减少）  
+     * 弱引用增减：`BC_INCREFS`（增加）、`BC_DECREFS`（减少）  
+   * 这些强/弱引用计数存储在 `binder_ref` 结构体中。  
+2. `binder_ref` 引用内核的 `binder_node` 对象  
+   * 内核维护的引用计数称为“内部”计数（驱动代码中的术语）：  
+     * 强引用计数：通过 `binder_node` 的 `internal_strong_refs` 字段维护。  
+     * 弱引用计数：隐式通过跟踪所有引用该节点的 `binder_ref` 对象列表来统计。  
+3. `binder_node` 引用用户空间的对象  
+   * 内核通过以下返回命令通知用户空间引用计数的变更：  
+     `BR_INCREFS`、`BR_ACQUIRE`、`BR_DECREFS`、`BR_RELEASE`。  
+   * 用户空间确认变更后，需响应：  
+     `BC_INCREFS_DONE` 和 `BC_ACQUIRE_DONE`。  
+   * 内核通过 `binder_node` 的 `local_[strong|weak]_refs` 字段部分跟踪这些计数。
+
+## 死亡通知
+
+死亡通知是 Binder 的一项独特功能，它允许进程在 Binder 对象销毁时收到通知。这一机制对于释放与远程 Binder 对象关联的资源非常有用，并在整个 Android 平台中广泛使用。
 
 ## 使用 Binder 发起 RPC 调用
 
@@ -690,3 +801,637 @@ binder_dec_node_tmpref(node); // 此后不能再使用`node`
 binder_node->refs指向Refs链表的头部。
 
 > TODO: 学习[Binder Internals](https://androidoffsec.withgoogle.com/posts/binder-internals/)
+
+# CVE-2022-20421
+
+具体而言，我们构建了一个可以将内核指针的最低两个有效字节清零的原语，并将其发展为类型混淆。然后利用这种类型混淆绕过kASLR和所有其他相关防护措施，获得任意内核读写能力。使用我们的技术，我们在三款Android设备（三星Galaxy S21 Ultra、三星Galaxy S22和谷歌Pixel 6）上成功利用了该Binder漏洞，假设攻击者已获得untrusted_app SELinux上下文下的代码执行权限。根据设备和后台活动情况，我们的攻击成功率可达4/5。
+
+本论文的主要贡献包括：
+1. 对我们新的自旋锁UAF利用技术的完整描述
+2. 对Binder漏洞的根因分析，包括扩大竞争窗口的技术
+3. [利用代码](https://github.com/0xkol/badspin)，该代码使用我们的技术在三种Android设备（三星Galaxy S21 Ultra、三星Galaxy S22和谷歌Pixel 6）上从untrusted_app SELinux上下文运行时获得任意读写原语
+
+## 漏洞点
+
+![CVE-2022-20421_vuln.png](./images/CVE-2022-20421_vuln.png)
+
+根据上图所示传输事务通过两步完成：
+1. 1326-1333行：为目标进程创建一个新的Binder引用。
+2. 1335行：在其Binder节点上增加引用计数。
+
+这里存在一个竞态问题：如果第二步失败了，新的引用是不会被清理的。
+
+```c
+/* A */                                   /* B */
+int binder_transaction(...) {
+  Allocate buffer in target process
+  Copy transaction data
+                                          exit(0)
+                                          > binder_deferred_release()
+                                          ==> Cleanup all references
+  Translate each object
+  Schedule transaction
+}
+```
+
+Binder漏洞（CVE-2022-20421） 是针对 `binder_proc` 对象的释放后使用（use-after-free）漏洞。其触发过程概括如下：  
+1. 发送事务：通过发送包含 HANDLE 或 WEAK_HANDLE 类型对象的事务。  
+2. 进程并行终止：在事务传输过程中，目标进程（事务接收方）被并行终止（例如被杀死）。  
+3. 残留对象：此时，内核会为正在退出的目标进程创建一个新的 `binder_ref` 对象，但 Binder 驱动未清理该对象。  
+4. 释放后指针残留：当目标进程的 `binder_proc` 对象被释放后，新创建的 `binder_ref` 仍保留一个指向已释放内存的内核指针。  
+5. 非法访问：随后，当该 `binder_ref` 引用的 `binder_node` 被释放时，内核会尝试对已释放的 `binder_proc` 执行 `spin_lock()` 操作，从而触发释放后使用（use-after-free）。  
+
+![CVE-2022-20421_process.png](./images/CVE-2022-20421_process.png)
+
+在进程C退出的过程中，会先释放所有的Binder节点，迭代释放节点的所有引用。
+
+这会导致在释放引用的过程中，触发进程B的binder_proc的UAF。
+
+```c
+static int binder_node_release(struct binder_node *node, int refs) {
+  ...
+  hlist_for_each_entry(ref, &node->refs, node_entry) {
+		refs++;
+		/*
+		 * Need the node lock to synchronize
+		 * with new notification requests and the
+		 * inner lock to synchronize with queued
+		 * death notifications.
+		 */
+		binder_inner_proc_lock(ref->proc);      [1]
+		if (!ref->death) {
+			binder_inner_proc_unlock(ref->proc);  [2]
+			continue;
+		}
+    ...
+  }
+  ...
+}
+```
+
+这里[1]和[2]涉及的锁为spinlock。
+
+### 设置
+
+为了触发这个漏洞，我们需要在三个进程之间建立 Binder IPC，分别命名为 A、B 和 C，这三个进程都在我们的控制之下。为此，我们滥用了 `/dev/hwbinder` 上下文中可以访问的 `ITokenManager` 服务。  
+这种方法是一种已知技巧，详细内容可以参考文献 [1]。
+
+### 在即将退出的进程中创建引用
+
+这一阶段，我们的目标是让进程 B 在**关闭 Binder 文件描述符**后，**依然收到一个新的引用（`binder_ref`）**。也就是说，尽管 B 进程的内部 Binder 结构已经经过了清理，但我们仍然可以为它创建新的引用。  
+需要注意的是，这一步本身并不足以直接触发漏洞，但却是后续攻击中非常关键的一步。
+
+要在进程 B 中创建新的 Binder 引用，需要向它发送一个包含特殊对象的事务。  
+正如背景介绍中讨论过的，新建 Binder 引用有两种方式：**传递一个本地 Binder 对象**，或者**传递一个远程 Binder 对象**。而本漏洞只能通过发送远程 Binder 对象来触发，且对象类型必须是 `HANDLE` 或 `WEAK_HANDLE`。  
+本节我们主要讲解如何通过 `WEAK_HANDLE` 来触发漏洞。
+
+由于新的引用只能通过事务来创建，而又无法向一个已经死亡的进程发送新事务，表面上看我们似乎无法达成目标。  
+这里，我们利用了驱动程序中的一个**竞态条件漏洞**来实现：
+- 让进程 A 向进程 B 发送一个包含 `WEAK_HANDLE` 对象的事务；
+- 同时安排进程 B 在接收事务的过程中**关闭自己的 Binder 文件描述符**。
+
+由于 A 已经开始处理事务，并且认为 B 仍然是活跃的，因此在事务处理期间不会意识到 B 已经死亡。  
+直到最后一步：当 A 尝试把新的事务挂到 B 某个 Binder 线程的工作队列上时，系统才会发现 B 已经死亡。  
+不过在那之前，事务中的所有对象（包括引用）已经完成了解析，这就足够支持我们的攻击了。
+
+值得一提的是，这个竞态窗口相当大，竞态从以下一系列调用开始：
+
+```c
+ref = binder_get_ref_olocked(proc, tr->target.handle, true); [1]
+if (ref)
+  target_node = binder_get_node_refs_for_txn(ref->node, &target_proc, &return_error); [2]
+```
+
+在步骤 [1] 中，系统会在进程 A 的数据结构中查找对应于进程 B 的节点（即事务目标节点）的 handle 值。如果找到，就会返回一个 `binder_ref` 结构体。
+
+在步骤 [2] 中，系统会验证进程 B 的 `binder_proc` 是否仍然存活（通过检查 `node->proc` 是否为非 NULL 来间接判断）。如果确定进程 B 还活着，就会分别对目标节点和进程 B 的 `binder_proc` 增加引用计数（refcount），以确保它们在事务处理期间不会被释放。
+
+这个竞态窗口会在驱动程序转换完 `WEAK_HANDLE` 对象时结束。因此，要成功利用这个竞态条件，我们必须确保：
+- 在步骤 [2] 调用之前，进程 B 必须是存活状态；
+- 在 `WEAK_HANDLE` 对象被转换时，进程 B 必须已经死亡（即 `binder_deferred_release()` 已经完成）。
+
+**总结一下**：如果成功获得这个竞态，那么进程 A 就能在进程 B 的 `binder_deferred_release()` 完成之后，继续执行对象转换的代码。由于事务中携带了一个 `WEAK_HANDLE` 类型的对象，因此会在进程 B 已经死亡的上下文中为它创建一个新的 Binder 引用。
+
+### 造成转换错误
+
+到目前为止，我们还没有真正达到 use-after-free（释放后使用） 的条件。仅仅关闭 Binder 文件描述符并不会立刻释放内部的 `binder_proc` 结构体，**因为它是带有引用计数的**。当进程 A 向进程 B 发送事务时，它会检查进程 B 是否存活，并增加 B 的 `binder_proc` 的引用计数。<font color="red">当进程 A 完成了事务处理（无论是成功还是错误流程），它都会释放掉这个引用计数，从而有可能导致 `binder_proc` 结构被 `kfree()`</font>。
+
+如果我们赢得了上面描述的那个竞态，那么我们可以保证事务处理将会走到错误处理（error flow）的路径。在释放 B 的 `binder_proc` 的最后一个引用之前，错误处理流程会清理已经转换完成的对象残留（也就是撤销每个转换动作的副作用）。  
+这个清理过程是在 `binder_transaction_buffer_release()` 函数中完成的，它会删除在进程 B 中新建的那个引用（即 `WEAK_HANDLE` 转换所产生的引用）。
+
+> 注意：到这里一切正常，还不会发生内存破坏。
+
+问题出在这样一种情况：<font color="red">如果在转换 `WEAK_HANDLE` 对象时发生了转换错误（即 `binder_translate_handle()` 返回错误），那么在错误处理流程中，只有那些成功转换过的对象会被清理。而那个转换失败的 `WEAK_HANDLE` 对象就不会被清理掉</font>。
+
+更糟糕的是，`binder_translate_handle()` 函数本身在某些错误条件下，也没有正确清理已经分配的引用。而这个“**binder_translate_handle() 未清理引用**”的问题，正是这个漏洞的**根本原因**。
+
+将这个事实与上面的竞态条件结合，我们就可以制造出一个不会被驱动程序清理掉的新建 Binder 引用。
+
+该漏洞的触发利用了**弱引用句柄的转换错误**。为了更好地理解弱引用句柄的转换是如何导致错误以及未清理的，我们需要了解转换远程 Binder 对象时所执行的步骤：
+1. 发送者（进程 A）指定的句柄值会被映射为一个 Binder 引用（`binder_ref`），从中可以获得指向 Binder 对象的 `binder_node` 结构的指针。
+2. 如果事务的目标进程（进程 B）与 Binder 对象的所有者（进程 C）不同：
+   - 在目标进程中（本例中为进程 B）查找与之通信的 Binder 对象的引用。如果尚不存在，就会分配一个新的引用，并插入到目标进程的相关数据结构中。
+   - 对 `binder_ref` 进行引用计数操作，无论它是新创建的还是已经存在的。
+
+如果最后一步（增加引用计数）出错，那么整个转换过程会被认为是失败的，且新创建的 `binder_ref` 不会被清理。
+
+接下来我们还需要说明最后一步是如何可能失败的，以及这种失败是如何被触发的。
+
+最后一步由函数 `binder_inc_ref_for_node()` 执行，它接收一个指向新创建的 `binder_ref` 的指针作为参数。
+在 `binder_inc_ref_olocked()` 中，会对这个新引用增加一个弱引用。由于这是一个新引用，因此也会对它所指向的节点（`node`）增加一个弱引用。
+错误条件就是在这一点被注入的：
+
+```c
+static int binder_inc_node_nilocked(
+    struct binder_node *node,   // 目标节点
+    int strong,                 // 强引用标记
+    int internal,               // 内部调用标记
+    struct list_head *target_list)
+{
+    struct binder_proc *proc = node->proc;  // 关联的进程
+    
+    if (strong) {               // 强引用逻辑
+        ...
+    } else {                    // 弱引用逻辑
+        if (!internal)          // 非内部调用时
+            node->local_weak_refs++;  // 增加弱引用计数
+        
+        if (!node->has_weak_ref &&            // [1] 无弱引用标记
+            list_empty(&node->work.entry)) {  // [2] 工作队列为空
+            
+            if (target_list == NULL) {    // 目标列表为空
+                return -EINVAL;               // [3] 错误返回
+            }
+            binder_enqueue_work_ilocked(&node->work, target_list);  // 加入工作队列
+        }
+    }
+    return 0;
+}
+```
+
+在我们的流程中，`strong` 为 `false`，且 `target_list` 为 `NULL`。因此，要使该函数返回 `-EINVAL` 错误（如注释 [3] 所示），必须满足以下两个条件：
+1. `node->has_weak_ref == 0`（如注释 [1] 所示）
+2. `node` 的工作链表（work list）为空（如注释 [2] 所示）
+
+当传递弱 Binder 引用时，可以同时实现这些条件，这就是第三个进程（进程 C）发挥作用的地方。
+
+接下来介绍如何**创建错误的 Binder 引用**。在竞争条件被触发（由进程 A 和 B）之前，进程 A 会确保其拥有一个能引发错误流程的 Binder 引用。这个错误的 Binder 引用将指向进程 C 中的一个 node。进程 C 按如下步骤使这个 Binder 引用变得有问题：
+1. C 创建一个新线程，称为 T。
+2. C 向 A 发送一个包含类型为 `BINDER`（强本地 Binder 对象）的事务。当该对象被转换时，会在 C 中创建一个新的 `binder_node`，并在 A 中创建一个新的 `binder_ref`。
+3. 进程 A 接受这个新的引用并获取一个强引用（以保持其存活）。
+4. 此时，新的 `binder_node` 的 `has_weak_ref` 字段为 0。然而，在其创建过程中，该 node 被插入到创建它的 Binder 线程（即 T）的工作链表中。当 T 处理其工作链表（通过对 `BINDER_READ_WRITE` ioctl 发起带读缓冲的调用）时，它会将 `node->has_weak_ref` 设置为 1。我们希望避免这种情况，并且将该 node 从任何链表中移除。为此，T 发起一个 ioctl 命令 `BINDER_THREAD_EXIT`。此 ioctl 会释放 T 的工作链表，从而将 node 从链表中删除，并且不会设置 `has_weak_ref` 字段。正是我们所希望的。
+
+**总结一下**，进程 A 与进程 C 之间的通信最终在 A 中创建了一个有缺陷的 Binder 引用。这个有缺陷的引用随后被传递给进程 B，同时，进程 B 关闭了它的文件描述符。如果竞争条件被赢得，一个新的 Binder 引用（`binder_ref`）会被插入到进程 B 中，尽管此时它已经死亡（即 `binder_deferred_release()` 已完成）。更重要的是，这个引用永远不会被驱动程序清除。
+
+### 总结
+
+`binder_ref` 结构中包含一个名为 `proc` 的字段，它指向所属的 `binder_proc`。在我们的场景中，这个过期的 Binder 引用归进程 B 所有，因此 `ref->proc` 指向 B 的 `binder_proc`。
+当 B 的 `binder_proc` 的最后一个引用计数被释放时，它将被 `kfree()`。而 `binder_deferred_release()` 完成后，B 的 `binder_proc` 的最后一个引用计数是由进程 A 保持的（因为 A 正在处理一个指向 B 的事务）。因此，当进程 A 完成对 B 的事务处理后，它将释放对 B 的 `binder_proc` 的最后一个引用，进而释放该结构。这意味着 `ref->proc` 此时将指向一个已被释放的内存位置，即一个悬空指针。
+
+如果 `ref->proc` 没有被使用，这还不是一个 use-after-free 漏洞。但确实存在一条代码路径会使用它：当进程 C 关闭其 Binder 文件描述符（或退出）时会触发这一情况。
+
+当进程 C 关闭其 Binder 文件描述符时，将会调用 `binder_deferred_release()`。该函数会释放所有属于 C 的 Binder 节点，通过对每一个节点调用 `binder_node_release()` 实现。在节点释放过程中，节点的所有引用会被枚举，以处理死亡通知。所以UAF的use点就在`binder_node_release()`的`spin_lock()`和`spin_unlock()`。
+
+## 原语
+
+为了利用 use-after-free 漏洞，我们将通过以下步骤构建有用的攻击原语：
+
+1. **释放漏洞对象**：第一步是触发漏洞并释放漏洞对象，同时保留对它的指针。在我们的案例中，漏洞对象是 `binder_proc`，触发漏洞的步骤已在上一节中描述。
+
+2. **重新分配对象**：在漏洞对象被释放后，我们重新分配内存给不同的对象或数据结构。这允许我们创建一个类型混淆漏洞（代码将数据解释为不同的类型）。
+
+3. **利用类型混淆**：最后，我们利用类型混淆来提取有用的攻击原语。在我们的案例中，如果我们使用一个对象 `Foo` 来重新分配内存，使其与 `binder_proc` 的 `inner_lock` 字段发生重叠，那么当我们触发 use-after-free 时，`bar` 将被解释为一个自旋锁。这可能会导致严重的后果，具体取决于 `bar` 原本的类型（指针、长度、引用计数等）。
+
+在本节中，我们将仔细研究 Android 内核中的自旋锁实现。令我们惊讶的是，这个实现比我们预想的要复杂，我们成功地从中提取出了强大的内存破坏原语。
+
+### 自旋锁
+
+请参考[spinlock](./spinlock.md)。
+
+从利用开发的角度来看，我们可以得出以下观察结果：
+* 解锁操作只会影响 `locked` 字节，其他字节保持不变。
+* 在步骤 [4]中的自旋操作仅检查 `locked` 字节，其他锁字节此时不被检查。
+* 如果锁处于争用状态，即 `(tail, pending) ≠ (0, 0)`，我们会在步骤 [2] 中跳转到排队标签。进入排队逻辑时，若 `tail` 字节是任意的，会导致不可控的内存损坏，可能导致崩溃。因此，我们应该避免跳转到排队逻辑。
+
+通过利用这些观察，我们设计了 3 个利用原语，呈现不同的强度级别。对于原语的描述，我们将锁值表示为元组 `(tail, pending, locked)`。
+
+**半递增原语**：对于这个原语，我们将锁值设置为 `(0, 0, x)`，其中 `x > 0`（即锁处于已锁定状态）。然后，我们触发“使用”操作，试图获取锁。由于锁处于已锁定状态，`pending` 位将被置1，锁的值变为 `(0, 1, x)`。这是一个半递增原语，因为它使得与锁重叠的值增加了 0x100。
+
+需要注意的是，获取锁的 CPU 会自旋，直到 `locked` 值（`x`）变为 0。这是双刃剑：我们可以利用这个情况，因为它为接下来的漏洞利用提供了足够的时间。然而，如果问题没有得到解决，在 10-20 秒后看门狗会导致内核崩溃。
+
+**半递减原语**：考虑另一种情况，当其他代码流程将 `locked` 字段设置为 0，而某个 CPU 正在自旋等待时。在这种情况下，CPU 会停止自旋并获取锁，锁的值变为 `(0, 0, 1)`。它将在临界区内保持这种状态，在我们的情况下这个临界区非常短。`spin_unlock()` 会将锁值变为 `(0, 0, 0)`。这是一个半递减原语，因为初始值为 `x > 0`，我们成功地将其减少为 0。
+
+半递减原语可用于递减一个引用计数字段（refcount）。其思想是：我们使用一个在 `inner_lock` 偏移处正好有一个 refcount 字段的对象来重分配该位置。我们首先将 refcount 增加到 `0xff`。接着调用 `spin_lock()`，refcount 会变成 `0x1ff`（因为 `pending` 位被设置了）。然后我们再将 refcount 增加一次，使其变为 `0x200`。此时最低有效字节（LSB）变为 0，CPU 会停止自旋，并且我们在极短时间内得到了一个值为 `0x1` 的 refcount。随后 `unlock` 函数会将 refcount 字段设置为 0。最后，我们通过再一次的“增加+减少”操作来释放对象，从而对这个新对象造成一个 use-after-free（释放后使用）漏洞。
+
+这种方法存在两个问题：
+1. 是我们必须找到一个结构体，它的 refcount 字段刚好在 `binder_proc.inner_lock` 的偏移处。此外，我们还必须能随意地增加和减少它。碰巧的是，在 `kmalloc-1k` 中，只有极少数对象的特定偏移处存在 refcount 类字段。虽然可以使用跨缓存攻击（cross-cache attack）来增加可利用对象的数量，但这会降低利用的可靠性。而且无论是否可靠，如果 `inner_lock` 的偏移在不同设备间不同，这种利用技术就无法通用。
+2. 是最后一步：在 refcount 为 0 时增加它。为了对新对象造成 use-after-free，我们需要能在 refcount 为 0 时增加它，然后再减少以释放对象。但问题是，当配置了 `CONFIG_REFCOUNT_FULL` 时，`refcount_t` 类型会检查 refcount 是否为 0，从而阻止这种操作。因此，我们只能寻找那些不使用 `refcount_t` 的对象，这样即使在 refcount 为 0 时也可以增加它。
+
+值得注意的是，`CONFIG_REFCOUNT_FULL` 在 Linux ≥ 5.7 的内核中被移除，因此对较新的设备而言这是一个可行的方法，但仍然面临偏移和通用性的问题。
+
+**归零低两位原语（Nullifying 2 LSBs Primitive）**：这个原语的开局与前一个类似：初始的锁值为 `(0, 0, x)`，其中 `x > 0`。在触发“使用”（use）之后，锁的值变为 `(0, 1, x)`，CPU 开始自旋，直到最低有效字节（locked 字节）变为 0。
+
+假设此时其他 CPU 将这个内存位置覆盖为 `(z, y, 0)`，其中 `z` 和 `y` 是任意值。在这种情况下，最低有效字节（LSB）为 0，所以正在自旋的 CPU 会停止循环，并尝试获取锁，此时锁的值变为 `(z, 0, 1)`（注意此处 `y` 被覆盖为了 0）。随后 `spin_unlock()` 将其设置为 `(z, 0, 0)`。
+
+从利用角度来看，这个原语非常有吸引力，因为它有潜力将一个指针的**最低两个字节归零**。
+
+## 利用
+
+基于归零低两位原语（2 LSBs nullifying primitive），我们构建了一种健壮且稳定的利用技术，它具有足够的通用性，可以适用于任何 8 字节对齐的 spinlock 偏移。利用该技术，我们成功绕过了现代 Android 内核的安全缓解机制，并实现了任意内核读写能力。此外，我们在三款 Android 设备上成功验证了该技术，包括多个厂商（Samsung、Google）、不同的 Android 版本（12、13）和不同的内核版本（5.4.x、5.10.x）。
+
+### 限制
+
+尽管该技术具有明显优势，但也存在一些缺点和局限性：
+* 首先，该技术要求内核为可抢占（preemptive）并运行在多核系统（SMP）上。这是实现 2 LSBs 归零原语的前提，如前文所述。
+* 其次，我们的利用假设 `GFP_KERNEL_ACCOUNT` 与 `GFP_KERNEL` 分配来自同一个 `kmem_cache`。这个假设在内核版本 5.10 上是成立的，并且在启用了 `CONFIG_MEMCG_KMEM` 的 5.4 内核上，如果通过内核启动参数 `cgroup.memory=nokmem` 禁用了内存控制组（cgroup）内存记账功能，同样成立。我们调查的多款 Samsung 设备（包括测试设备 Samsung Galaxy S21 Ultra，运行内核版本 5.4.129）都符合这一假设。
+* 最后，相比其他利用技术，我们的技术可能更难实施和执行。
+
+### 目标对象分配
+
+为了使利用手法在 `inner_lock` 的偏移变化下具有一定的抗性，一个理想的对象是一个指针数组。通过这种方式，我们可以调整利用方式以始终破坏一个指针（即将其低两位清零），前提是 `inner_lock` 的偏移是 8 字节对齐的。
+
+内核中有多条代码路径会分配一个指针数组。其中一个有趣的例子是文件描述符表（file descriptor table）。文件描述符表是一个 `struct file` 指针的数组，每个 `struct file` 表示一个打开的文件（包含其位置、标志、inode 等信息）。文件描述符表通过进程的 `files_struct` 结构中的 `fdt` 字段进行关联。
+
+文件描述符（fd）只是进程文件描述符表中的索引。
+
+在 Linux 中，`files_struct` 本身包含一个内联的文件描述符表版本，可以存储 64 个打开的文件，而不需要分配一个更大的文件描述符表。这样做是为了优化，在进程使用少量文件描述符时减少内存占用。如果一个进程使用超过 64 个文件，文件描述符表就会以不同的结构进行分配，通过调用 `alloc_fdtable(nr)` 完成。
+
+有两种情况会分配文件描述符表。
+1. 是当一个新进程通过 `fork()`（或不带 `CLONE_FILES` 的 `clone()`）创建时。如果父进程拥有超过 64 个文件描述符，则会为子进程调用 `alloc_fdtable(nr)`；否则使用内联的 fdtable。
+2. 第二种情况是当 `expand_files()` 被调用以扩展一个进程的文件描述符表时。我们可以通过 `dup2()` 系统调用触发该函数：
+
+```c
+int dup2(int oldfd, int newfd);
+```
+
+`dup2()` 系统调用创建一个新的文件描述符（`newfd`），它指向与已有描述符（`oldfd`）相同的打开文件。如果 `newfd` 已经是打开状态，则会在被复用前先关闭它。
+
+如果一个进程从启动开始时拥有的文件描述符数量 ≤ 64，那么当我们调用 `dup2(oldfd, newfd)` 且 `newfd ≥ 64` 时，它的文件描述符表就必须被扩展以容纳新的 `newfd`，因此会分配一个更大的文件描述符表。
+
+无论出于什么原因，只要需要为文件描述符表进行较大的分配，都会通过 `alloc_fdtable(nr)` 函数来完成：
+
+```c
+struct fdtable *alloc_fdtable(unsigned int nr)
+{
+    struct fdtable *fdt;
+    void *data;
+    nr /= (1024 / sizeof(struct file *));
+    nr = roundup_pow_of_two(nr + 1);
+    nr *= (1024 / sizeof(struct file *));                    // 1
+    ...
+    fdt = kmalloc(sizeof(struct fdtable), GFP_KERNEL_ACCOUNT);
+    if (!fdt)
+        goto out;
+    fdt->max_fds = nr;
+    data = kvmalloc_array(nr, sizeof(struct file *),
+                          GFP_KERNEL_ACCOUNT);              // 2
+    if (!data)
+        goto out_fdt;
+    fdt->fd = data;
+    ...
+    return fdt;
+out_fdt:
+    kfree(fdt);
+out:
+    return NULL;
+}
+```
+
+当 `nr < 128` 时，在注释 1 处会被向上取整为 128。然后在注释 2 处会分配一个包含 128 个 `struct file` 指针的数组（共 1024 字节）。这次分配会使用通用缓存 `kmalloc-1k`，这对我们来说是理想的，因为它使用的缓存与我们的漏洞对象 `binder_proc` 相同。
+
+在后续的利用过程中，我们将使用 `dup2()` 函数来触发这个分配。通过这种方法，我们可以支持 `inner_lock` 偏移 ≥ 512 的情况。这对我们来说是可以接受的，因为我们没有遇到偏移小于这个值的情况。否则，我们将采用 `fork()` 方法。
+
+### 清零文件指针的低 2 字节
+
+在本节中，我们将调整「低 2 字节清零」原语以破坏一个 `struct file` 指针。
+
+回顾一下，要触发该原语，我们需要以锁值为 `(0, 0, 𝑥)`（其中 𝑥 > 0）的状态进入 `spin_lock()`。为此，我们将使用值为 `0x00000041` 的数据反复填充来重新分配 `binder_proc`，该数据存储在 TTY 写缓冲区中。当我们首次向打开的伪终端（PTY）写入数据时，TTY 写缓冲区会使用 `kmalloc()` 分配。它的一个有用属性是：我们可以将任意的二进制数据写入其中。下面的代码片段会在 `kmalloc-1k` 通用缓存中分配一个 TTY 写缓冲区：
+
+```c
+char data[1024];
+int pty_fd = open("/dev/ptmx", O_RDWR);
+write(pty_fd, data, 1024);
+```
+
+> 注意：这一步是堆喷填充，以修改锁的四字节值。
+
+在重新分配之后，我们会通过关闭进程 C 来触发 use-after-free，使得 `spin_lock()` 被调用。TTY 写缓冲区中的一个 `0x00000041` 值将与锁值重叠，并变为 `0x00000141`（pending 位被设置）。此时 CPU 将持续自旋，直到 LSB（此时是 `0x41`）变为 0。
+
+接下来，在另一个 CPU 上，我们将释放该 TTY 写缓冲区，并通过 `dup2()` 技术将其重新分配为文件描述符表。但这个方法存在一个障碍：文件描述符表的分配虽然是通过普通的 `kmalloc()`（而不是 `kzalloc()`），但由于 **Android 内核默认启用了 `init_on_alloc` 策略**，因此其内容会被初始化为 0。
+
+这很糟糕，因为值为 0 会导致正在自旋的 CPU 过早退出自旋循环，甚至在 `struct file` 指针还未写入该位置前就退出了。
+
+为了解决这个问题，我们会**通过中断让正在自旋的 CPU 承受更多压力，从而尽可能减缓它的执行速度**。这样，我们就有机会赢得一个极小的竞争窗口：即文件描述符表被初始化为 0 后，在自旋 CPU 发现之前，`struct file` 指针已经被写入目标位置。
+
+我们发现 Jann Horn 提出的 timerfd 技术可以很好地实现这一目标。
+
+即使我们通过中断赢得了这个微小的竞争条件，也无法保证与锁重叠的 `struct file` 指针的最低字节（LSB）正好为 0。然而，LSB 为 0 对该原语是否成功至关重要，否则 CPU 将会无限自旋。
+
+为了解决这个问题，我们反复执行如下操作：
+`dup2(random_fd, target_fd)`，其中 `target_fd` 是通过 `binder_proc` 的 `inner_lock` 偏移除以 8 计算得出的（即，使得 `fdt[target_fd]` 与锁值重叠）。
+
+根据 `filp_cache` 的大小以及 `struct file` 的大小，我们可以计算出一个随机 `struct file` 指针的 LSB 为 0 的概率。例如，若 `filp_cache` 大小为 2 个页面，`struct file` 的大小为 `0x140` 字节，则每个 slab 中将有 25 个 `struct file` 对象，其中有 7 个的 LSB 为 0。因此，重复执行 16 次 `dup2(random_fd, target_fd)` 可保证成功率大于 99%。
+
+一旦某个 `struct file` 的 LSB 为 0 被放置在该位置，自旋的 CPU 将会退出自旋循环，同时使第二个最低字节被清零——这正是我们想要实现的指针破坏。
+
+总结：为了将一个 `struct file` 指针的低 2 字节清零，我们需要执行以下步骤：
+1. 触发漏洞，使得进程 B 的 `binder_proc` 结构被释放，并且有一个指向它的指针保留在 `ref->proc` 中。此时还不要触发 “use”（即不要关闭进程 C）。
+2. 通过喷射 TTY 写缓冲区来重新分配 `binder_proc` 结构。让这些 TTY 写缓冲区反复填充 `0x00000041`（即 LSB 非零，其余为零）。
+3. 在 CPU 4 上触发 “use”：关闭进程 C，从而调用 `spin_lock()`，并锁定到某个值为 `0x00000041` 的位置。这会将值变为 `0x00000141`，随后 CPU 4 会持续自旋，直到该位置的 LSB 变为 0。
+4. 在 CPU 4 上提升 timerfd 中断频率，使其在 `spin_lock()` 中自旋时显著变慢。这能让我们有机会在分配 `fdtable` 并被初始化为 0 时抢先将其覆盖。
+5. 释放 TTY 写缓冲区，并使用 `dup2()` 技术重新分配为 `fdtable`（即目标分配对象）。
+6. 持续调用 `dup2(random_fd, target_fd)`，直到某个 `struct file` 指针的 LSB 为 0 并被放置到该偏移位置。一旦发生，CPU 4 会停止自旋并退出 `spin_lock()`。随后，在 `spin_unlock()` 之后，该 `struct file` 指针将被破坏（其低 2 字节变为 0）。
+
+### 利用策略
+
+![CVE-2022-20421_phys.png](./images/CVE-2022-20421_phys.png)
+
+我们的前提是：我们可以破坏（即将低两位字节清零）一个位于已知文件描述符编号的 `struct file` 指针。接下来我们将按以下步骤实现任意的内核读/写（R/W）能力：
+1. 塑造物理内存布局：确保从一个 **16 页对齐** 的地址开始，内存布局依次为：一个 `kmalloc-1k` slab（其中包含我们可控的对象），紧接着是 4 个 `filp` slab（见上图所示）。
+   这样一来，如果我们破坏了位于这些 `filp` 缓存之一中的某个 `struct file` 指针，它将指向 `kmalloc-1k` slab 中的第一个对象。
+2. 填充 `kmalloc-1k` slab：使用 TTY 写缓冲区填充该 slab，使我们可以用任意数据控制其内容。每个 TTY 写缓冲区都将填入一个伪造的 `struct file`。
+3. 调用 `close()`：对被破坏的 fd 调用 `close()`，最终会释放 TTY 写缓冲区。
+4. 捕获被释放的 TTY 写缓冲区：通过分配一个 `struct pipe_buffer` 数组来占据该已释放内存。
+5. 泄露某个 `pipe_buffer`：借此绕过内核地址空间随机化（kASLR）。
+6. 伪造一个 `pipe_buffer` 并使用管道实现对线性映射（linear mapping）的任意 R/W 操作。
+7. 覆写 `addr_limit`：从而获取完整的任意 R/W 能力，并绕过 AArch64 架构下的 UAO（用户访问禁止）机制。
+
+下面我们将详细描述每一个步骤。
+
+### 塑造物理内存
+
+本漏洞利用的其余部分假设：被破坏的 struct file 指针指向一个由我们控制的 TTY 写缓冲区。在本步骤中，我们将塑造物理内存，使该假设极有可能成立。（不要将此 TTY 写缓冲区与用于触发清零 2 LSBs 原语的缓冲区混淆。）
+
+为了判断此类假设是否可行，我们需要查看用于分配 struct file 和 TTY 写缓冲区的 slab 的物理特性。
+
+struct file 是从一个名为 filp\_cache 的专用内存池中分配的。每个 filp\_cache slab 使用两个物理页，并且每个 slab 最多可以容纳 25 个 struct file。
+
+TTY 写缓冲区是从通用用途缓存 kmalloc-1k 中分配的。kmalloc-1k 缓存每个 slab 最多包含 32 个对象。每个对象大小为 1024 字节，因此每个 slab 使用总共 8 页。
+
+我们的总体计划是以特定方式喷射大量 struct file 和 TTY 写缓冲区，使得在一个 16 页对齐地址的开头我们有包含可控内容的 TTY 写缓冲区，而 struct file 位于其后，如上图所示。
+
+请注意，如果我们破坏的是上图中任何 filp 缓存中的 struct file，则结果指针将指向 kmalloc-1k slab 的起始地址（该地址充满了我们控制内容的 TTY 写缓冲区）。因此，在执行 dup2(random\_fd, target\_fd) 操作时，我们设计漏洞利用方案以使用这些 filp 中的随机文件。
+
+我们的喷射策略是尽可能多地重复以下操作：分配 32 个 TTY 写缓冲区，然后打开 25 × 4 = 100 个文件。通过这样做，我们希望首先分配的 32 个对象会为 kmalloc-1k 创建一个新的 slab。接着，我们期望随后 100 次文件分配操作会为 filp\_cache 创建 4 个新的 slab。
+
+需要注意的是，系统对于打开伪终端的数量是有限制的（在 Android 上默认值为 4096；参见 `/proc/sys/kernel/pty/max`）。因此，我们最多可以重复上述操作 4096/32 = 128 次。
+
+显然，愿望不一定总能实现。为了提高命中概率并确保在喷射过程中能够分配新的 slab，我们执行了一些“预热”轮次。在预热阶段，我们会大量分配 filp\_cache 和 kmalloc-1k 中的对象。在这一阶段，我们不会使用 TTY 写缓冲区进行喷射 —— 因为这是一个有限且宝贵的资源。我们改为简单地打开 `/dev/hwbinder` 设备 —— 这将分别从 filp\_cache 和 kmalloc-1k 中分配 struct file 和 binder\_proc。
+
+关于预热阶段，需要注意的是，每个进程在打开文件描述符的数量上也有上限（Android 上为 32768；参见 `/proc/[pid]/limits`）。因此，我们将预热阶段分布到多个进程中进行。
+
+### 处理物理内存构造失败
+
+![CVE-2022-20421_phys_situation.png](./images/CVE-2022-20421_phys_situation.png)
+
+为了使利用更可靠，我们必须检测内存构造是否成功。为此，我们需要区分以下几种情况（见上图）：
+1. **损坏的文件指针指向我们在 kmalloc-1k 中的 TTY 写缓冲区**。这是我们期望的情况。
+2. **损坏的文件指针指向某个未知的页面**。在这种情况下，对该文件执行的任何操作都可能导致系统混乱。因此，我们会小心地阻塞持有该损坏文件的进程，直到利用成功并且我们能够修复这种情况。
+3. **损坏的文件指针指向某个 struct file**。在这种情况下，我们也可以保留损坏文件对应进程的存活。但为了减少每次失败尝试对系统负载的累积，我们将该文件发送到一个专门的“墓地”进程中（通过 UNIX 套接字实现）。该文件将在墓地进程中维持存在，直到利用成功并能进行修复。
+
+我们通过间接推断损坏文件指针的某些位值来对每种情况进行分类。其思路如下：我们对损坏的 fd 执行某个操作（系统调用），并从其结果中推断出若干位的值。例如，我们曾使用的一种方法是调用 `timerfd_gettime()`，以判断 `fdget()` 是否会在该 struct file 上成功：
+
+```c
+bool fdget_succeed(int fd) {
+    int ret = timerfd_gettime(fd, NULL);
+    if (ret == -1 && errno == EBADF)
+        return false;
+    else if (ret == -1 && errno == EINVAL)
+        return true;
+    /* 不可达。“fd” 不是 timerfd 文件。 */
+}
+```
+
+假设损坏的 fd 没有碰巧落在一个 timerfd 类型的文件上，那么此方法可以告诉我们 `fdget()` 是否通过。如果通过了，这表明该文件的引用计数大于 0，且其文件模式未设置 `FMODE_PATH` 位。这给了我们两个 bit 的信息。我们以类似方式继续提取更多关于该文件的位信息。
+
+需要注意的是，我们对损坏文件执行的任何操作都必须避免对其任何指针的解引用，因为可能存在“未知页面”的情况。这极大地限制了我们能调用的系统调用的数量。例如，这排除了诸如读取 `/proc/[pid]/fdinfo/[fd]` 这样的简单方法。此外，任何在实现中调用了 LSM hook 的系统调用（例如 `fcntl()`）也无法使用，因为这些 hook 会解引用 `f_security`。
+
+总之，如果构造失败，我们会重启利用流程并重试。一旦成功，我们会关闭该损坏的文件描述符并进入下一步骤。
+
+### 关闭损坏的文件描述符
+
+我们的策略是对损坏的 fd 调用 `close()`，以释放 TTY 写缓冲区。为实现这一点，我们需要构造一个伪造的 `struct file`，使内核“心甘情愿”地释放我们控制的对象。
+
+当调用 `close()` 时，最终会调用函数 `filp_close()`（位于 `fs/open.c`）：
+
+```c
+int filp_close(struct file *filp, fl_owner_t id)
+{
+    int retval = 0;
+    if (!file_count(filp)) {                       // ①
+        printk("VFS: Close: file count is 0\n");
+        return 0;
+    }
+    if (filp->f_op->flush)                         // ②
+        retval = filp->f_op->flush(filp, id);
+    if (likely(!(filp->f_mode & FMODE_PATH))) {    // ③
+        dnotify_flush(filp, id);
+        locks_remove_posix(filp, id);
+    }
+    fput(filp);                                    // ④
+    return retval;
+}
+```
+
+我们的目标是进入函数 `fput(filp)` ④， 因为它会将文件计数减 1，如果计数变为 0，就会释放文件结构。为此，我们需要满足以下三个条件：
+1. 文件计数必须为 1：这确保我们通过条件 ①，且在 `fput()` 中会释放文件结构（而不仅仅是将引用计数减 1）。
+2. 文件操作指针 `f_op` 必须是一个有效的内核指针，且 `f_op->flush` 必须为 0：这是为了确保我们通过条件 ②。我们可以将 `f_op` 指向一个内核中已知包含 8 字节全为 0 的固定地址。
+3. 文件模式 `f_mode` 必须设置了 `FMODE_PATH` 位：这是为了避免进入条件 ③ 中的分支。
+
+如果满足上述条件，`fput()` 将调用实际释放文件结构的函数 `__fput()`：
+
+```c
+static void __fput(struct file *file)
+{
+    struct dentry *dentry = file->f_path.dentry;
+    struct vfsmount *mnt = file->f_path.mnt;
+    struct inode *inode = file->f_inode;
+    fmode_t mode = file->f_mode;
+    if (unlikely(!(file->f_mode & FMODE_OPENED)))  // ①
+        goto out;
+    ...
+out:
+    file_free(file);                                // ②
+}
+```
+
+如果没有设置 `FMODE_OPENED` 位 ①，我们会立即进入 `file_free(file)` ②（定义在 `fs/file_table.c`）：
+
+```c
+static inline void file_free(struct file *f)
+{
+    security_file_free(f);
+    if (!(f->f_mode & FMODE_NOACCOUNT))
+        percpu_counter_dec(&nr_files);
+    call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
+}
+```
+
+其中，`security_file_free(f)` 会在释放之前检查 `f_security` 是否为 NULL，因此我们设置 `f->f_security = NULL`，它将立即返回。之后，在 RCU 宽限期结束后，将调用 `file_free_rcu()`：
+
+```c
+static void file_free_rcu(struct rcu_head *head)
+{
+    struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+    put_cred(f->f_cred);
+    kmem_cache_free(filp_cachep, f);               // ①
+}
+```
+
+调用 `kmem_cache_free()` 将释放文件结构 `f`。重要的是，`f` 会被释放回其原始分配所在的 slab，而不是传入参数 `filp_cachep` 所指的 slab。换句话说，它的行为等价于 `kfree(f)`，除了会在内核消息（kmsg）中输出一条警告：
+
+```
+cache_from_obj: Wrong slab cache. filp but object is from kmalloc-1k
+```
+
+造成这种行为的原因在于：**Linux 的 SLUB 分配器是根据对象的虚拟地址（而不是 `kmem_cache_free()` 的参数）来确定目标 slab 的**。
+
+最终结果是：在关闭损坏的 fd 后，一个 TTY 写缓冲区被释放，但该缓冲区还有其他引用（如 TTY 文件描述符）指向这个（已释放的）地址。
+
+> 注意：此时成功地将利用阶段升级为一个 对 TTY 写缓冲区的 Use-After-Free（UAF）。
+
+### 泄露 Pipe Buffer
+
+我们将利用这个 Use-After-Free 情况来泄露结构体 `pipe_buffer` 的内容：
+
+```c
+/**
+* struct pipe_buffer - 一个 Linux 内核的管道缓冲区
+* @page: 包含管道缓冲区数据的页
+* @offset: 数据在 @page 中的偏移
+* @len: 数据在 @page 中的长度
+* @ops: 与该缓冲区相关联的操作
+* @flags: 管道缓冲区标志
+* @private: 被 ops 拥有的私有数据
+**/
+struct pipe_buffer {
+    struct page *page;
+    unsigned int offset, len;
+    const struct pipe_buf_operations *ops;
+    unsigned int flags;
+    unsigned long private;
+};
+```
+
+我们对这个结构体感兴趣，是因为通过泄露它我们可以获得一个指向 `struct page` 的指针，并且最重要的是获得一个指向 pipe 操作（`ops`）的指针，该指针存储在内核数据段中。这意味着 `ops` 相对于内核镜像起始位置有一个固定偏移。（这个“固定偏移”可能在不同的内核版本和配置之间会变化，但在每个设备的每个内核上是相同的。）因此，在泄露了 `ops` 之后，我们可以从中减去一个固定偏移量，从而计算出内核镜像的基地址，进而绕过 kASLR 缓解措施。
+
+当使用系统调用 `pipe()` 分配一个管道时，会通过 `kcalloc()` 分配一个包含 16 个 `struct pipe_buffer` 的数组（位于 fs/pipe.c）：
+
+```c
+struct pipe_inode_info *alloc_pipe_info(void)
+{
+    struct pipe_inode_info *pipe;
+    unsigned long pipe_bufs = PIPE_DEF_BUFFERS;
+    pipe = kzalloc(sizeof(struct pipe_inode_info),
+        GFP_KERNEL_ACCOUNT);
+    ...
+    pipe->bufs = kcalloc(pipe_bufs, sizeof(struct
+        pipe_buffer), GFP_KERNEL_ACCOUNT);  // ①
+    ...
+}
+```
+
+`struct pipe_buffer` 的大小为 40 字节，因此 `pipe->bufs` 数组的大小为 16 × 40 = 640 字节，因此它将被分配在 `kmalloc-1k` 通用缓存中。
+
+这对我们来说非常完美，因为我们可以用这个 pipe buffer 数组来覆盖先前被释放的 TTY 写缓冲区。
+
+现在，我们的思路是确保单个 pipe buffer 的 `page` 和 `ops` 字段被填充，然后使用我们从 TTY 文件描述符的第二个引用读取该 pipe buffer 的内容。
+
+可以通过向管道写入，比如 0x1000 字节，来轻松填充一个 pipe buffer。我们确保该操作不会阻塞，通过让 pipe 的写端进入非阻塞模式。
+
+> 注意：为什么要确保不阻塞？如果管道的写端是阻塞模式，内核会在管道缓冲区满的时候让调用进程睡眠（blocking），直到有读取发生、缓冲区腾出空间为止。
+
+从被重叠的 TTY 写缓冲区中读取数据比直接调用 `read()` 读取 TTY 文件描述符更复杂。
+
+当向 TTY 写入数据时，数据会写入到一个 TTY 写缓冲区（见 `drivers/tty/tty_io.c` 中的 `do_tty_write()`）。然后，该写缓冲区会被传递给 `n_tty_write()`（位于 `drivers/tty/n_tty.c`），该函数内部调用 `pty_write()`（在 `drivers/tty/pty.c` 中）。在 `pty_write()` 中，写缓冲区的数据被复制到 TTY 的另一端。在我们的情况下，另一端由我们控制，因此我们可以通过**在 TTY 文件描述符上调用 `read()` 来读取已复制的数据**。
+
+我们得出的结论是：我们无法直接读取 TTY 写缓冲区的内容，因为我们**读取的是之前写入数据的副本**。然而，考虑这样一种情况：在数据被写入写缓冲区之后、但在写缓冲区中的数据被复制到另一端之前，我们阻塞写入线程。在这种情况下，当写入线程被阻塞时，任何写入该内存位置的新数据都将在写入线程解除阻塞后被复制到另一端。
+
+因此，为了泄露一个 pipe buffer，我们向 TTY 写缓冲区写入全零，并在写缓冲区被复制之前阻塞写入线程。在线程阻塞期间，我们使用另一个线程向损坏的 pipe 写入数据（比如 0x1000 字节）。回忆一下，这个操作会向写缓冲区填充某个 `pipe_buffer` 的 `struct page` 和 `ops` 指针。然后我们解除写入线程的阻塞，让写缓冲区中保存的数据被复制到 TTY 的另一端 —— 此时这些数据将包含 `pipe_buffer` 的内容。接着我们从 TTY 文件描述符中读取，从而泄露 `pipe_buffer`。
+
+剩下的问题是**如何精确地在我们想要的位置阻塞写入线程**。为此，我们使用 TTY 驱动的软件流控制功能。可以使用 `ioctl` 命令 `TCXONC` 作用于 TTY 文件描述符来挂起数据的发送或接收。如果参数是 `TCIOFF`，那么写入线程将在 `n_tty_write()` 中被阻塞。要解除写入线程的阻塞，我们使用 `TCION` 替代 `TCIOFF`。这正是我们想要的功能。
+
+> 注意：此时泄漏pipe buffer则可绕过kASLR。
+
+### 对线性映射的任意读写
+
+到目前为止，情况如下：我们已经绕过了 kASLR（通过泄露 pipe buffer 的内容），并且我们拥有两个指向同一内存位置的引用：TTY 写缓冲区和 pipe buffer 数组。通过向 TTY 文件描述符写数据，我们实际上是向 TTY 写缓冲区写入 —— 从而修改了 pipe buffer 数组的内容。
+
+我们可以利用被破坏的 pipe 实现 “写任意数据到任意地址”（write-what-where） 和 “任意读” 的能力。其核心思想是：使用 TTY fd 覆盖某个 pipe buffer，使其指向我们希望读取/写入的物理页地址。随后，通过对该 pipe 执行读/写操作，可以将目标页的内容读出到用户空间缓冲区，或将用户空间的数据写入目标页。
+
+为了实现这个思路，我们需要**将线性映射中的内核虚拟地址转换为 `struct page` 的地址**。理解这种转换方式，首先需要了解内核是如何管理物理内存的。
+
+内核使用 `struct page` 来描述单个物理页。PFN（页帧号）和 `struct page` 之间是一一对应的。然而，不同架构可能会将某些内存区域保留，不被内核使用。Linux 通过 SPARSEMEM 内存模型支持这一点。在启用了 `CONFIG_SPARSEMEM_VMEMMAP` 的 AArch64 Linux 上，内核在启动时会分配一段连续的虚拟内存区域用于存储 `struct page` 数组，这些结构体用于表示内核可以使用的每一页物理内存。这段区域被称为 `vmemmap`。
+
+这样做的目的是为了加快页与虚拟地址之间的转换。给定**线性映射中的一个虚拟地址 `x`**，我们可以通过如下方式计算其对应的 `struct page` 地址：
+
+```c
+struct page *virt_to_page(void *x) {
+    u64 index = ((u64)x - PAGE_OFFSET) / PAGE_SIZE;
+    u64 addr = VMEMMAP_START + index * sizeof(struct page);
+    return (struct page *)addr;
+}
+```
+
+在 AArch64 Linux ≥ v5.4（配置为 39 位虚拟地址）的系统中，`PAGE_OFFSET` 通常为 `0xffffff8000000000`。`VMEMMAP_START` 定义在 `arch/arm64/include/asm/memory.h` 中，它是指向 `vmemmap` 起始地址的固定虚拟地址。
+
+### 任意读写
+
+我们通过覆盖当前任务的 `addr_limit` 并绕过 UAO（用户访问覆盖）机制，实现了对任意内核虚拟地址的读写能力。
+
+**定位 task\_struct**
+
+要修改 `addr_limit`，首先需要找到当前任务的 `task_struct` 指针。我们采用一个朴素的方法，从内核镜像数据段中的 `init_task` 开始遍历任务链表。
+
+利用我们前面实现的读写原语，可以可靠地对线性映射（linear mapping）中的任意地址进行读写，而 `task_struct` 就存储在内核堆中，也就是线性映射范围内。
+
+但对内核镜像地址（比如 `init_task`）的读写需要先转换为线性映射地址。这个转换方式会根据设备不同而不同，取决于内核镜像是否进行了物理地址随机化（physical KASLR）。
+
+> 注意：什么是物理地址随机化？参考[mem.md](./mem.md#物理地址随机化)。
+
+在测试的 Samsung 设备上，虚拟 KASLR 和物理 KASLR 滑动量相等。因此，如果我们已知虚拟 KASLR 滑动量，那么该转换就变成了减去一个常数。
+
+在 Google Pixel 6 上没有启用物理 KASLR，因此地址转换如下：
+
+```c
+u64 kimg_to_lm(u64 x){
+    return PAGE_OFFSET + (x - kimg_base);
+}
+```
+
+**UAO 简介**
+
+UAO（User Access Override）是 Armv8.2 引入的一项特性，用于控制非特权 load/store 指令（如 `ldtr*` / `sttr*`）的行为。
+
+这些指令在 EL1（内核态）执行时，会表现得就像在 EL0（用户态）执行一样。这允许内核在不临时关闭 PAN（Privilege Access Never）的情况下访问用户空间内存。因此，内核的用户访问函数如 `copy_from_user()` 和 `copy_to_user()` 会使用这些指令。
+
+但有些场景下，内核会使用 `copy_[from|to]_user()` 去操作内核地址而非用户地址。如果使用非特权指令访问内核地址，就会引发访问错误。UAO 正是为了解决这种情况而设计的。
+
+启用 UAO 后，非特权指令的行为被覆盖为普通指令（如 `ldr*` / `str*`），即不再模拟用户态访问。这样，在启用了 UAO 的情况下，`copy_from_user()` 之类的函数可以安全地操作内核地址，但此时 PAN 是开启的，因此无法访问用户地址。
+
+在 Linux 中，只有当任务的 `addr_limit` 设置为 `KERNEL_DS`（内核地址空间）时，才会启用 UAO，否则就会禁用。
+
+**绕过 UAO**
+
+为了实现完全的任意读写能力，我们采用以下策略：
+
+* 创建两个线程 T1 和 T2。
+* 使用前面获得的 R/W 原语，将 T2 的 `addr_limit` 设置为 `KERNEL_DS`，从而启用 UAO。
+* T1 和 T2 共享一段内存区域，并通过管道（pipe）进行内核数据读写。
+
+例如，实现 `kernel_read(addr, size)` 操作时：
+* 让 T2 执行 `write(pipe[1], addr, size)`，将内核地址 `addr` 处的数据写入管道。
+  * 由于 T2 的 UAO 已启用，因此此操作不会失败。
+* 然后，T1 调用标准的 `read()` 从管道中读取数据。
+
+类似地，`kernel_write(addr, size)` 的实现思路相同，只是反过来写。
+
+共享内存用于 T1 与 T2 之间的同步和信息传递，使得 T2 无需执行系统调用就能传递（只包含内核地址的）数据缓冲区。
+
+### 提权
+
+存在多种技术手段可以以 root 用户身份执行代码，并禁用或绕过 SELinux 以及其他安全防护机制。具体的技术因设备厂商、内核版本、Android 版本等而异。
+
+在 **Samsung Galaxy S22** 和 **Google Pixel 6** 设备上，`selinux_state` 结构体中包含了一个 `enforce` 字段（因为内核启用了 `SECURITY_SELINUX_DEVELOP` 选项），因此，在这些设备上绕过 SELinux 的方法就是将该字段的值覆盖为 `0`。
+
+要在 **Pixel 6** 上获取 root 权限，我们只需将当前任务的 `task_struct` 中的 `cred` 和 `real_cred` 字段替换为 init 进程的凭据（credentials）。
