@@ -8,11 +8,11 @@
 > 重复周期：2025/07/12-2025/08/23 16:00-18:00, 每周 (周六)
 > #腾讯会议：625-1089-8614
 
-* [录屏下载链接](https://pan.ruc.edu.cn/link/AAC2DAE7A9334149F9913389186D7694B1)
+* [录屏下载链接](https://pan.ruc.edu.cn/anyshare/zh-cn/dir/92A32D42BD0B4C918AD39FFF3F445A29)
 
 ## 环境
 
-* [环境下载链接](https://pan.ruc.edu.cn/link/AAC2DAE7A9334149F9913389186D7694B1)
+* [环境下载链接](https://pan.ruc.edu.cn/anyshare/zh-cn/dir/92A32D42BD0B4C918AD39FFF3F445A29)
   * VMWare虚拟机的两个虚拟化选项不是必选。
   * 宿主机用户user，密码abcd1234。
 * [环境搭建文档](https://github.com/CheUhxg/Linux-Kernel-Note/blob/main/Tutor/exp/setup.md)
