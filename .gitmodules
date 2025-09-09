@@ -1,0 +1,3 @@
+[submodule "Tutor/exp"]
+	path = Tutor/exp
+	url = https://github.com/CheUhxg/RUC-OS_Kernel_Experiment-2025.git
